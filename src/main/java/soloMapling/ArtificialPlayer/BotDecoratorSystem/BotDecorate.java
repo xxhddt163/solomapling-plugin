@@ -299,7 +299,7 @@ public class BotDecorate {
     public static void setBotVariables(Character bot) {
         BotTier tier = getRandomTier();
         bot.setTier(tier);
-        int level = generateBotLevel(tier, 10, 80);
+        int level = generateBotLevel(tier, 10, 150);
         int job = selectJobByLevel(level);
         bot.setGender(selectRandomGender());
         bot.setLevel(level);
