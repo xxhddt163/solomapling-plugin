@@ -8,7 +8,7 @@ package soloMapling.ArtificialPlayer.BotFlavorSystem;
 public enum FlavorAction {
     EMOTE(5),
     BUFF_FLEX(3),
-    SKILL_SWING(3);
+    SKILL_SWING(0);
 
     public final int weight;
 
