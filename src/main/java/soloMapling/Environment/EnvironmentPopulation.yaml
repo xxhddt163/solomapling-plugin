@@ -16,7 +16,7 @@
 # Optional per-map curation: pins / ban / boost. TownPins.txt merges in at load.
 
 version: 1
-scale: 1.0
+scale: 0.7
 
 waves:
   essentials:
