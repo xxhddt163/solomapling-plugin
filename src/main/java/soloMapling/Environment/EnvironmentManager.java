@@ -51,6 +51,7 @@ import static soloMapling.Environment.PlatformPlacement.spawnFillerBotsLockedY;
 import static soloMapling.Environment.PlatformSpawner.findUnoccupiedPoint;
 import static soloMapling.Environment.PlatformSpawner.findUnoccupiedPoints;
 import static soloMapling.FreeMarket.ArtificialFreeMarket.populateFreeMarketRegion;
+import static soloMapling.FreeMarket.ArtificialFreeMarket.startFreeMarketRefreshScheduler;
 import static soloMapling.server.SoloMaplingUtilities.getMapleMapById;
 
 import java.util.Random;
@@ -305,6 +306,11 @@ public class EnvironmentManager {
 
         BotDecorationQueue.start();
         BotEquipChecker.start();
+
+        // The artificial Free Market is a 24-hour lifecycle: after its stall
+        // lifetime expires, only SoloMapling-created shops/bots are cleared and
+        // the complete FM population is generated again. Player shops are untouched.
+        startFreeMarketRefreshScheduler();
 
         double totalSeconds = (System.currentTimeMillis() - startupStart) / 1000.0;
         System.out.println(String.format(

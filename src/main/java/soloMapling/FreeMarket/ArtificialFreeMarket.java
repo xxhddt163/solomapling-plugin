@@ -7,6 +7,7 @@ import org.gms.net.server.Server;
 import org.gms.server.maps.HiredMerchant;
 import org.gms.server.maps.PlayerShop;
 import org.gms.server.maps.PlayerShopItem;
+import org.gms.server.maps.MapleMap;
 import soloMapling.server.ExecutorServiceManager;
 import org.gms.util.PacketCreator;
 
@@ -17,6 +18,9 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Set;
 
 import static soloMapling.ArtificialPlayer.BotCustomization.getRandomChairId;
 import static soloMapling.ArtificialPlayer.BotCustomization.getRandomStorePermitId;
@@ -50,6 +54,7 @@ import static soloMapling.FreeMarket.HiredMerchantArtificial.shopTypes.*;
 import static soloMapling.server.ExecutorServiceManager.getExecutorService;
 import static soloMapling.server.ExecutorServiceManager.getScheduledExecutorService;
 import static soloMapling.server.SoloMaplingUtilities.chance;
+import static soloMapling.server.SoloMaplingUtilities.getMapleMapById;
 
 public class ArtificialFreeMarket {
 
@@ -57,47 +62,87 @@ public class ArtificialFreeMarket {
     private static final Random random = new Random();
     public static FMShopInfoManager fmInfo = new FMShopInfoManager();
 
+    /**
+     * Artificial Free Market lifecycle:
+     * one complete generated market lives for 24 hours, then only our
+     * artificial shops are removed and the market is generated again.
+     */
+    private static final long FM_REFRESH_INTERVAL_HOURS = 24L;
+    private static final int FM_SHOP_COLLISION_RADIUS = 40;
+    private static final AtomicBoolean fmRefreshSchedulerStarted = new AtomicBoolean(false);
+    private static final AtomicInteger fmGeneration = new AtomicInteger(0);
+    private static final Object FM_REFRESH_LOCK = new Object();
+
+    // Only shops/bots created by SoloMapling are stored here. Real player shops
+    // are never added, so a refresh cannot delete them.
+    private static final Set<PlayerShop> artificialPlayerShops = ConcurrentHashMap.newKeySet();
+    private static final Set<Character> artificialShopBots = ConcurrentHashMap.newKeySet();
+    private static final Set<HiredMerchantArtificial> artificialMerchants = ConcurrentHashMap.newKeySet();
+    private static final ConcurrentHashMap<HiredMerchantArtificial, Integer> artificialMerchantChannelKeys =
+            new ConcurrentHashMap<>();
+
+    // Prevents duplicate generation when the same FM region is triggered more than once.
+    private static final Set<String> reservedGenerationSpots = ConcurrentHashMap.newKeySet();
+
     public static void populateFreeMarketSpot(Client c) {
         spawnHiredMerchantStore(c.getPlayer().getMapId(), c.getPlayer().getPosition());
     }
 
     public static void populateFreeMarketFull() {
         List<String> regions = List.of("henesys", "ludi", "perion", "elnath");
+        int generation = fmGeneration.get();
+        reservedGenerationSpots.clear();
         for (String region : regions) {
-            populateFreeMarketRegion(region);
+            populateFreeMarketRegion(region, generation);
         }
     }
-
 
     public static void populateFreeMarketRegion(String region) {
-        // Fire every room in the region in parallel. Each room's internal work is
-        // already offloaded to executors, so this just kicks them off concurrently
-        // instead of sleeping 5s between maps.
+        populateFreeMarketRegion(region, fmGeneration.get());
+    }
+
+    private static void populateFreeMarketRegion(String region, int generation) {
         for (int mapId : fmInfo.getRegionFMMapId(region)) {
-            ExecutorServiceManager.runAsync(() -> populateFreeMarketRoom(mapId));
+            ExecutorServiceManager.runAsync(() -> populateFreeMarketRoom(mapId, generation));
         }
     }
 
-    public static void populateFreeMarketRoom(int mapId) {
+    private static void populateFreeMarketRoom(int mapId, int generation) {
+        if (!isCurrentGeneration(generation)) {
+            return;
+        }
+
         String region = getRegionByMapId(mapId);
         debugprint("Populating room: ", mapId);
 
         List<Point> positions = fmInfo.getRegionFMSpots(region);
         AtomicInteger delayCounter = new AtomicInteger(0);
-
         double hiredMerchantChance = getHiredMerchantChance(mapId);
 
         for (Point position : positions) {
-            // ~2% per-spot skip. Use continue so we don't abandon the rest of the room.
+            if (!isCurrentGeneration(generation)) {
+                return;
+            }
             if (chance(2)) {
                 continue;
             }
+
+            // Reserve the configured spot before scheduling asynchronous work.
+            // This closes the race where two population calls both see an empty spot.
+            if (!reserveGenerationSpot(mapId, position, generation)) {
+                continue;
+            }
+
             if (Math.random() < hiredMerchantChance) {
-                ExecutorServiceManager.runAsync(() -> spawnHiredMerchantStore(mapId, position));
+                ExecutorServiceManager.runAsync(() -> {
+                    if (isCurrentGeneration(generation)) {
+                        spawnHiredMerchantStore(mapId, position, generation);
+                    }
+                });
             } else {
-                // Stagger bot-shop creation with small delays instead of blocking
-                int delay = delayCounter.getAndIncrement() * 200; // 200ms between each
-                getScheduledExecutorService().schedule(() -> createBotShopAtLocation(position, mapId),
+                int delay = delayCounter.getAndIncrement() * 200;
+                getScheduledExecutorService().schedule(
+                        () -> createBotShopAtLocation(position, mapId, generation),
                         delay, TimeUnit.MILLISECONDS);
             }
         }
@@ -112,7 +157,17 @@ public class ArtificialFreeMarket {
 
 
     private static void spawnHiredMerchantStore(int mapId, Point position) {
-        if (calculateSkippedSpot(mapId)) {
+        spawnHiredMerchantStore(mapId, position, fmGeneration.get());
+    }
+
+    private static void spawnHiredMerchantStore(int mapId, Point position, int generation) {
+        if (!isCurrentGeneration(generation) || calculateSkippedSpot(mapId)) {
+            return;
+        }
+
+        MapleMap map = getMapleMapById(mapId);
+        if (hasShopNearPosition(map, position, FM_SHOP_COLLISION_RADIUS)) {
+            debugprint("Skipping occupied FM spot: " + mapId + " " + position);
             return;
         }
 
@@ -305,6 +360,8 @@ public class ArtificialFreeMarket {
         newchar.setHiredMerchant(merchant);
         newchar.getWorldServer().registerHiredMerchant(merchant);
         newchar.getWorldServer().getChannel(1).addHiredMerchant(newchar.getId(), merchant);
+        artificialMerchants.add(merchant);
+        artificialMerchantChannelKeys.put(merchant, newchar.getId());
         return merchant;
     }
 
@@ -389,9 +446,16 @@ public class ArtificialFreeMarket {
     public static void BotPlayerStorePermit(Character fakechar) {
         String desc = "Test";
         Integer shopItemId = getRandomStorePermitId();
+        MapleMap map = fakechar.getMap();
+        if (map == null || hasShopNearPosition(map, fakechar.getPosition(), FM_SHOP_COLLISION_RADIUS)) {
+            return;
+        }
+
         PlayerShop ps = new PlayerShop(fakechar, desc, shopItemId);
         fakechar.setPlayerShop(ps);
-        fakechar.getMap().addMapObject(ps);
+        map.addMapObject(ps);
+        artificialPlayerShops.add(ps);
+        artificialShopBots.add(fakechar);
 
         HiredMerchantArtificial hma = generateHiredMerchantShopData(fakechar, fakechar.getName(), fakechar.getId(), desc, 5030000, fakechar.getMapId());
         String desc2 = hma.getDescription();
@@ -437,46 +501,185 @@ public class ArtificialFreeMarket {
 //    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
 
     public static void createBotShopAtLocation(Point position, int mapId) {
+        createBotShopAtLocation(position, mapId, fmGeneration.get());
+    }
+
+    private static void createBotShopAtLocation(Point position, int mapId, int generation) {
         getExecutorService().submit(() -> {
+            if (!isCurrentGeneration(generation)) {
+                return;
+            }
+
+            MapleMap map = getMapleMapById(mapId);
+            if (hasShopNearPosition(map, position, FM_SHOP_COLLISION_RADIUS)) {
+                debugprint("Skipping occupied FM bot-shop spot: " + mapId + " " + position);
+                return;
+            }
+
             debugprint("Making shop at: " + mapId + ", " + position);
-
-//            int botId = BotGeneration.createBot(position, getMapleMapById(mapId));
-//            // Poll for bot readiness - check every 100ms up to 3 seconds
-//            Character fakechar2 = null;
-//            for (int i = 0; i < 30; i++) { // 30 * 100ms = 3000ms max
-//                try {
-//                    Thread.sleep(100);
-//                    fakechar2 = BotHelpers.getCharFromChannelStorage(botId);
-//                    if (fakechar2 != null) {
-//                        debugprint("Bot " + botId + " ready after " + ((i + 1) * 100) + "ms");
-//                        break; // Bot is ready, proceed immediately
-//                    }
-//                } catch (InterruptedException e) {
-//                    Thread.currentThread().interrupt();
-//                    return;
-//                }
-//            }
-
             Character fakechar2 = createBotPollReadiness(position, mapId);
             if (fakechar2 == null) {
                 System.err.println("Bot not ready after 3 seconds, skipping store");
                 return;
             }
 
-            // The spawn drop-down/turn-around choreography plays asynchronously,
-            // so wait it out before opening the store - a shop popping open while
-            // the bot is still mid-drop looks broken.
+            artificialShopBots.add(fakechar2);
+
             getScheduledExecutorService().schedule(() -> runAsync(() -> {
+                if (!isCurrentGeneration(generation)) {
+                    BotGeneration.removeBotFromServer(fakechar2);
+                    artificialShopBots.remove(fakechar2);
+                    return;
+                }
+
+                MapleMap currentMap = fakechar2.getMap();
+                if (currentMap == null || hasShopNearPosition(currentMap, fakechar2.getPosition(), FM_SHOP_COLLISION_RADIUS)) {
+                    BotGeneration.removeBotFromServer(fakechar2);
+                    artificialShopBots.remove(fakechar2);
+                    return;
+                }
+
                 BotPlayerStorePermit(fakechar2);
+
+                if (fakechar2.getPlayerShop() == null) {
+                    BotGeneration.removeBotFromServer(fakechar2);
+                    artificialShopBots.remove(fakechar2);
+                    return;
+                }
 
                 if (Math.random() < 0.5) {
                     microTurnAround(fakechar2);
                 }
                 if (Math.random() < 0.4) {
-                    getScheduledExecutorService().schedule(() -> botSitChair(fakechar2, getRandomChairId()),
-                            500, TimeUnit.MILLISECONDS);
+                    getScheduledExecutorService().schedule(() -> {
+                        if (isCurrentGeneration(generation)) {
+                            botSitChair(fakechar2, getRandomChairId());
+                        }
+                    }, 500, TimeUnit.MILLISECONDS);
                 }
             }), BotGeneration.SPAWN_CHOREOGRAPHY_MAX_MS, TimeUnit.MILLISECONDS);
         });
     }
+
+    /** Starts the 24-hour artificial Free Market lifecycle. */
+    public static void startFreeMarketRefreshScheduler() {
+        if (!fmRefreshSchedulerStarted.compareAndSet(false, true)) {
+            return;
+        }
+
+        long interval = FM_REFRESH_INTERVAL_HOURS * 60L * 60L * 1000L;
+        getScheduledExecutorService().scheduleAtFixedRate(() -> {
+            try {
+                refreshFreeMarket();
+            } catch (Throwable t) {
+                System.err.println("[FreeMarket] 24-hour refresh failed:");
+                t.printStackTrace();
+            }
+        }, interval, interval, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Recreates the artificial Free Market as if the server had restarted.
+     * Real player shops are deliberately not touched.
+     */
+    public static void refreshFreeMarket() {
+        synchronized (FM_REFRESH_LOCK) {
+            int newGeneration = fmGeneration.incrementAndGet();
+            reservedGenerationSpots.clear();
+
+            debugprint("Starting 24-hour Free Market refresh, generation=" + newGeneration);
+            clearArtificialFreeMarket();
+            populateFreeMarketFull();
+            debugprint("24-hour Free Market refresh scheduled, generation=" + newGeneration);
+        }
+    }
+
+    private static void clearArtificialFreeMarket() {
+        for (PlayerShop shop : artificialPlayerShops) {
+            try {
+                MapleMap map = shop.getOwner() != null ? shop.getOwner().getMap() : null;
+                if (map != null) {
+                    map.broadcastMessage(PacketCreator.removePlayerShopBox(shop));
+                    map.removeMapObject(shop);
+                }
+                shop.setOpen(false);
+                if (shop.getOwner() != null && shop.getOwner().getPlayerShop() == shop) {
+                    shop.getOwner().setPlayerShop(null);
+                }
+            } catch (Throwable t) {
+                System.err.println("[FreeMarket] Failed to remove artificial PlayerShop:");
+                t.printStackTrace();
+            }
+        }
+        artificialPlayerShops.clear();
+
+        for (HiredMerchantArtificial merchant : artificialMerchants) {
+            try {
+                MapleMap map = merchant.getMap();
+                if (map != null) {
+                    map.broadcastMessage(PacketCreator.removeHiredMerchantBox(merchant.getOwnerId()));
+                    map.removeMapObject(merchant);
+                }
+
+                Integer channelKey = artificialMerchantChannelKeys.get(merchant);
+                if (channelKey != null) {
+                    Server.getInstance().getChannel(0, 1).removeHiredMerchant(channelKey, merchant);
+                }
+                Server.getInstance().getWorld(0).unregisterHiredMerchant(merchant);
+            } catch (Throwable t) {
+                System.err.println("[FreeMarket] Failed to remove artificial HiredMerchant:");
+                t.printStackTrace();
+            }
+        }
+        artificialMerchants.clear();
+        artificialMerchantChannelKeys.clear();
+
+        for (Character bot : artificialShopBots) {
+            try {
+                BotGeneration.removeBotFromServer(bot);
+            } catch (Throwable t) {
+                System.err.println("[FreeMarket] Failed to remove artificial FM bot " + bot.getId() + ":");
+                t.printStackTrace();
+            }
+        }
+        artificialShopBots.clear();
+    }
+
+    private static boolean isCurrentGeneration(int generation) {
+        return fmGeneration.get() == generation;
+    }
+
+    private static boolean reserveGenerationSpot(int mapId, Point position, int generation) {
+        if (!isCurrentGeneration(generation)) {
+            return false;
+        }
+        return reservedGenerationSpots.add(spotKey(mapId, position));
+    }
+
+    private static String spotKey(int mapId, Point position) {
+        return mapId + ":" + position.x + ":" + position.y;
+    }
+
+    private static boolean hasShopNearPosition(MapleMap map, Point position, int radius) {
+        if (map == null || position == null) {
+            return false;
+        }
+
+        double radiusSquared = (double) radius * radius;
+        for (HiredMerchant merchant : map.getAllHiredMerchants()) {
+            Point actual = merchant.getPosition();
+            if (actual != null && actual.distanceSq(position) <= radiusSquared) {
+                return true;
+            }
+        }
+
+        for (PlayerShop shop : map.getAllPlayerShops()) {
+            Point actual = shop.getPosition();
+            if (actual != null && actual.distanceSq(position) <= radiusSquared) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 }
